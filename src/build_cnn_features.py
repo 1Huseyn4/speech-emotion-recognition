@@ -1,62 +1,46 @@
+"""Build the MFCC matrices used by the CNN.
+
+Output (in data/processed/cnn_features/):
+    mfcc.npy    - float32 array, shape (N, N_MFCC, MAX_LEN), zero-padded
+    labels.csv  - index, emotion, actor_id, length (number of real frames)
+"""
 
 from pathlib import Path
 
-import librosa
 import numpy as np
 import pandas as pd
 
-# 1. Metadata faylını oxu
+from utils import MAX_LEN, N_MFCC, load_mfcc_matrix
+
 METADATA_PATH = Path("data/processed/metadata.csv")
 OUTPUT_DIR = Path("data/processed/cnn_features")
 
-df = pd.read_csv(METADATA_PATH)
 
-# 2. MFCC parametrləri
-N_MFCC = 13
-MAX_LEN = 200
+def main():
+    df = pd.read_csv(METADATA_PATH)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    matrices = []
+    rows = []
 
-labels = []
+    for index, row in df.iterrows():
+        mfcc, length = load_mfcc_matrix(row["file_path"])
+        matrices.append(mfcc)
+        rows.append({
+            "index": index,
+            "emotion": row["emotion"],
+            "actor_id": row["actor_id"],
+            "length": length,
+        })
 
-# 3. Hər audio faylını emal et
-for index, row in df.iterrows():
-    signal, sr = librosa.load(
-        row["file_path"],
-        sr=22050
-    )
+    X = np.stack(matrices)
+    np.save(OUTPUT_DIR / "mfcc.npy", X)
+    pd.DataFrame(rows).to_csv(OUTPUT_DIR / "labels.csv", index=False)
 
-    mfcc = librosa.feature.mfcc(
-        y=signal,
-        sr=sr,
-        n_mfcc=N_MFCC
-    )
+    print("Total audio files processed:", len(rows))
+    print("MFCC array shape:", X.shape, f"(expected (N, {N_MFCC}, {MAX_LEN}))")
+    print("Saved to:", OUTPUT_DIR)
 
-    # 4. Bütün səsləri eyni uzunluğa gətir
-    if mfcc.shape[1] < MAX_LEN:
-        pad_width = MAX_LEN - mfcc.shape[1]
-        mfcc = np.pad(
-            mfcc,
-            ((0, 0), (0, pad_width)),
-            mode="constant"
-        )
-    else:
-        mfcc = mfcc[:, :MAX_LEN]
 
-    # 5. Hər səsin MFCC matrisini saxla
-    np.save(OUTPUT_DIR / f"{index}.npy", mfcc)
-
-    labels.append({
-        "index": index,
-        "emotion": row["emotion"],
-        "actor_id": row["actor_id"]
-    })
-
-# 6. Etiketləri ayrıca CSV faylında saxla
-labels_df = pd.DataFrame(labels)
-labels_df.to_csv(OUTPUT_DIR / "labels.csv", index=False)
-
-print("Total audio files processed:", len(labels_df))
-print("MFCC shape for each audio:", (N_MFCC, MAX_LEN))
-print("Saved features to:", OUTPUT_DIR)
-print("Saved labels to:", OUTPUT_DIR / "labels.csv")
+if __name__ == "__main__":
+    main()

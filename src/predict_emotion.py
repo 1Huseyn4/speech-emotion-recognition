@@ -1,105 +1,79 @@
+"""Predict the emotion of any WAV file with the trained CNN.
 
+Usage:
+    python src/predict_emotion.py path/to/audio.wav
+    python src/predict_emotion.py path/to/audio.wav --model models/emotion_cnn.pth
+"""
+
+import argparse
 from pathlib import Path
 
-import librosa
 import numpy as np
 import torch
-import torch.nn as nn
+
+from model import EmotionCNN
+from utils import apply_normalizer, load_mfcc_matrix
 
 
-class EmotionCNN(nn.Module):
-    def __init__(self, num_classes=8):
-        super().__init__()
-
-        self.features = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Flatten(),
-        )
-
-        self.classifier = nn.Sequential(
-            nn.Linear(4800, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, num_classes),
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        return self.classifier(x)
-
-
-def extract_mfcc(audio_path):
-    audio, sr = librosa.load(audio_path, sr=22050)
-
-    mfcc = librosa.feature.mfcc(
-        y=audio,
-        sr=sr,
-        n_mfcc=13,
+def parse_args():
+    parser = argparse.ArgumentParser(description="Predict emotion from a speech WAV file.")
+    parser.add_argument("audio", type=Path, help="Path to a .wav file")
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=Path("models/emotion_cnn.pth"),
+        help="Path to the trained CNN checkpoint",
     )
-
-    target_length = 200
-
-    if mfcc.shape[1] < target_length:
-        mfcc = np.pad(
-            mfcc,
-            ((0, 0), (0, target_length - mfcc.shape[1])),
-        )
-    else:
-        mfcc = mfcc[:, :target_length]
-
-    return torch.tensor(
-        mfcc,
-        dtype=torch.float32,
-    ).unsqueeze(0).unsqueeze(0)
+    parser.add_argument("--top", type=int, default=3, help="How many top emotions to print")
+    return parser.parse_args()
 
 
 def main():
-    model_path = Path("models/emotion_cnn.pth")
+    args = parse_args()
 
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model not found: {model_path}")
+    if not args.audio.exists():
+        raise FileNotFoundError(f"Audio file not found: {args.audio}")
+    if not args.model.exists():
+        raise FileNotFoundError(
+            f"Model not found: {args.model}. Train it first with: python src/train_cnn.py"
+        )
 
-    # Datasetdəki WAV fayllarından birini avtomatik seç
-    audio_files = list(Path("data").rglob("*.wav"))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if not audio_files:
-        raise FileNotFoundError("No WAV files found in data/")
+    checkpoint = torch.load(args.model, map_location=device, weights_only=True)
+    classes = checkpoint["emotion_classes"]
+    mean = np.array(checkpoint["mean"], dtype=np.float32)
+    std = np.array(checkpoint["std"], dtype=np.float32)
 
-    audio_path = audio_files[0]
-
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
-
-    checkpoint = torch.load(
-        model_path,
-        map_location=device,
-        weights_only=True,
-    )
-
-    emotion_classes = checkpoint["emotion_classes"]
-
-    model = EmotionCNN(num_classes=len(emotion_classes)).to(device)
+    model = EmotionCNN(
+        num_classes=len(classes),
+        n_mfcc=checkpoint["n_mfcc"],
+        max_len=checkpoint["max_len"],
+    ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    features = extract_mfcc(audio_path).to(device)
+    # Same preprocessing as training: MFCC -> pad/crop -> normalise with training statistics
+    mfcc, length = load_mfcc_matrix(
+        args.audio,
+        n_mfcc=checkpoint["n_mfcc"],
+        max_len=checkpoint["max_len"],
+    )
+    mfcc = apply_normalizer(mfcc[np.newaxis], np.array([length]), mean, std)
+    features = torch.tensor(mfcc, dtype=torch.float32).unsqueeze(1).to(device)
 
     with torch.no_grad():
-        outputs = model(features)
-        probabilities = torch.softmax(outputs, dim=1)
-        confidence, prediction = probabilities.max(dim=1)
+        probabilities = torch.softmax(model(features), dim=1)[0]
 
-    emotion = emotion_classes[prediction.item()]
+    top = min(args.top, len(classes))
+    values, indices = probabilities.topk(top)
 
-    print(f"Audio file: {audio_path}")
-    print(f"Predicted emotion: {emotion}")
-    print(f"Confidence: {confidence.item():.2%}")
+    print(f"Audio file: {args.audio}")
+    print(f"Predicted emotion: {classes[indices[0].item()]}")
+    print(f"Confidence: {values[0].item():.2%}")
+    print("\nTop predictions:")
+    for value, index in zip(values, indices):
+        print(f"  {classes[index.item()]:<10} {value.item():.2%}")
 
 
 if __name__ == "__main__":

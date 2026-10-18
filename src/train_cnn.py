@@ -1,226 +1,233 @@
+"""Train and evaluate the CNN (actor-independent train / validation / test split).
+
+Protocol
+--------
+* Test set      : the SAME held-out actors as the SVM (see utils.actor_split).
+* Validation set: a few of the remaining actors, used for early stopping only.
+* Normalisation : per-MFCC-coefficient mean/std computed on training data only.
+* Augmentation  : random time and frequency masking on training batches.
+"""
+
+import json
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    ConfusionMatrixDisplay,
+    accuracy_score,
+    classification_report,
+    f1_score,
+)
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import accuracy_score, classification_report
-from sklearn.metrics import ConfusionMatrixDisplay
-import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, TensorDataset
 
+from model import EmotionCNN
+from utils import (
+    MAX_LEN,
+    N_MFCC,
+    SEED,
+    actor_split,
+    apply_normalizer,
+    fit_normalizer,
+    set_seed,
+    train_val_split,
+)
 
-
-# Faylların yerləşdiyi qovluq
 DATA_DIR = Path("data/processed/cnn_features")
+MODEL_DIR = Path("models")
+RESULTS_DIR = Path("results")
 
-# Etiketləri oxu
-labels_df = pd.read_csv(DATA_DIR / "labels.csv")
-
-# GPU varsa GPU, yoxdursa CPU seç
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-print("Device:", device)
-print("Total samples:", len(labels_df))
-print("Emotions:", sorted(labels_df["emotion"].unique()))
-
-# Emosiya adlarını rəqəmlərə çevir
-label_encoder = LabelEncoder()
-y = label_encoder.fit_transform(labels_df["emotion"])
-
-# Bütün MFCC fayllarını oxu
-X = np.array([
-    np.load(DATA_DIR / f"{index}.npy")
-    for index in labels_df["index"]
-])
-
-# CNN üçün kanal ölçüsü əlavə et
-X = X[:, np.newaxis, :, :]
-
-# Təlim və test hissələrinə ayır
-X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
-    test_size=0.2,
-    random_state=42,
-    stratify=y
-)
-
-print("X shape:", X.shape)
-print("X_train shape:", X_train.shape)
-print("X_test shape:", X_test.shape)
-print("Number of classes:", len(label_encoder.classes_)) 
-
-# CNN arxitekturasını əlavə et
+BATCH_SIZE = 32
+MAX_EPOCHS = 80
+PATIENCE = 12          # stop if validation loss does not improve for this many epochs
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
 
 
-class EmotionCNN(nn.Module):
-    def __init__(self, num_classes):
-        super().__init__()
+def augment(batch):
+    """SpecAugment-style masking applied independently to each sample in a batch."""
+    batch = batch.clone()
+    for i in range(batch.shape[0]):
+        t_width = np.random.randint(0, 21)
+        t_start = np.random.randint(0, MAX_LEN - t_width + 1)
+        batch[i, :, :, t_start:t_start + t_width] = 0.0
 
-        self.features = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
+        f_width = np.random.randint(0, 3)
+        f_start = np.random.randint(0, N_MFCC - f_width + 1)
+        batch[i, :, f_start:f_start + f_width, :] = 0.0
+    return batch
 
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
 
-            nn.Flatten()
+def evaluate_loss(model, X, y, criterion):
+    model.eval()
+    with torch.no_grad():
+        return criterion(model(X), y).item()
+
+
+def main():
+    set_seed(SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", device)
+
+    # ---------------------------------------------------------------- data
+    labels_df = pd.read_csv(DATA_DIR / "labels.csv")
+    X = np.load(DATA_DIR / "mfcc.npy")                       # (N, N_MFCC, MAX_LEN)
+    lengths = labels_df["length"].to_numpy()
+    groups = labels_df["actor_id"].to_numpy()
+
+    label_encoder = LabelEncoder()
+    y = label_encoder.fit_transform(labels_df["emotion"])
+    classes = label_encoder.classes_.tolist()
+
+    train_val_idx, test_idx = actor_split(groups)
+    train_idx, val_idx = train_val_split(train_val_idx, groups)
+
+    print("Samples  train/val/test:", len(train_idx), len(val_idx), len(test_idx))
+    for name, idx in (("train", train_idx), ("val", val_idx), ("test", test_idx)):
+        print(f"Actors   {name:<5}:", sorted(int(a) for a in set(groups[idx])))
+
+    # Normalisation statistics come from the training samples only
+    mean, std = fit_normalizer(X[train_idx], lengths[train_idx])
+
+    def prepare(idx):
+        Xn = apply_normalizer(X[idx], lengths[idx], mean, std)[:, np.newaxis, :, :]
+        return (
+            torch.tensor(Xn, dtype=torch.float32).to(device),
+            torch.tensor(y[idx], dtype=torch.long).to(device),
         )
 
-        self.classifier = nn.Sequential(
-            nn.Linear(32 * 3 * 50, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, num_classes)
-        )
+    X_train, y_train = prepare(train_idx)
+    X_val, y_val = prepare(val_idx)
+    X_test, y_test = prepare(test_idx)
 
-    def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        return x
-
-
-model = EmotionCNN(num_classes=len(label_encoder.classes_)).to(device)
-
-print(model)
-
-
-# NumPy massivlərini PyTorch tensorlarına çevir
-X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
-X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
-
-y_train_tensor = torch.tensor(y_train, dtype=torch.long)
-y_test_tensor = torch.tensor(y_test, dtype=torch.long)
-
-# Məlumatları GPU-ya göndər
-X_train_tensor = X_train_tensor.to(device)
-X_test_tensor = X_test_tensor.to(device)
-
-y_train_tensor = y_train_tensor.to(device)
-y_test_tensor = y_test_tensor.to(device)
-
-print("Training tensor:", X_train_tensor.shape)
-print("Test tensor:", X_test_tensor.shape)
-print("Tensors are on:", X_train_tensor.device)
-
-
-# Səhvin ölçülməsi üçün funksiya
-criterion = nn.CrossEntropyLoss()
-
-# Modelin parametrlərini yeniləmək üçün optimizer
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-print("Loss function:", criterion)
-print("Optimizer:", optimizer)
-
-
-
-from torch.utils.data import TensorDataset, DataLoader
-
-# Məlumatları kiçik qruplara böl
-train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=32,
-    shuffle=True
-)
-
-# Modeli öyrət
-epochs = 20
-
-for epoch in range(epochs):
-    model.train()
-    total_loss = 0.0
-
-    for X_batch, y_batch in train_loader:
-        # Əvvəlki gradientləri sıfırla
-        optimizer.zero_grad()
-
-        # Modelin proqnozunu al
-        outputs = model(X_batch)
-
-        # Səhvi hesabla
-        loss = criterion(outputs, y_batch)
-
-        # Səhvin model parametrlərinə təsirini hesabla
-        loss.backward()
-
-        # Model parametrlərini yenilə
-        optimizer.step()
-
-        total_loss += loss.item()
-
-    average_loss = total_loss / len(train_loader)
-
-    print(
-        f"Epoch [{epoch + 1}/{epochs}], "
-        f"Loss: {average_loss:.4f}"
+    train_loader = DataLoader(
+        TensorDataset(X_train, y_train),
+        batch_size=BATCH_SIZE,
+        shuffle=True,
     )
 
+    # --------------------------------------------------------------- model
+    model = EmotionCNN(num_classes=len(classes)).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-# Modeli qiymətləndirmə rejiminə keçir
-model.eval()
+    best_val_loss = float("inf")
+    best_state = None
+    epochs_without_improvement = 0
+    history = {"train_loss": [], "val_loss": []}
 
-# Gradient hesablamasını söndür
-with torch.no_grad():
-    # Test məlumatları üzrə proqnoz al
-    outputs = model(X_test_tensor)
+    # ------------------------------------------------------------ training
+    for epoch in range(1, MAX_EPOCHS + 1):
+        model.train()
+        total_loss = 0.0
 
-    # Hər nümunə üçün ən yüksək ehtimallı sinfi seç
-    predictions = torch.argmax(outputs, dim=1)
+        for X_batch, y_batch in train_loader:
+            optimizer.zero_grad()
+            loss = criterion(model(augment(X_batch)), y_batch)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
 
-# Nəticələri CPU-da NumPy massivlərinə çevir
-y_true = y_test_tensor.cpu().numpy()
-y_pred = predictions.cpu().numpy()
+        train_loss = total_loss / len(train_loader)
+        val_loss = evaluate_loss(model, X_val, y_val, criterion)
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
 
-# Ümumi dəqiqliyi hesabla
-accuracy = accuracy_score(y_true, y_pred)
+        print(f"Epoch [{epoch:02d}/{MAX_EPOCHS}]  train loss: {train_loss:.4f}  val loss: {val_loss:.4f}")
 
-print(f"\nTest Accuracy: {accuracy:.2%}")
-print("\nClassification Report:")
-print(
-    classification_report(
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= PATIENCE:
+                print(f"Early stopping at epoch {epoch} (best val loss {best_val_loss:.4f})")
+                break
+
+    model.load_state_dict(best_state)
+
+    # ---------------------------------------------------------- evaluation
+    model.eval()
+    with torch.no_grad():
+        predictions = torch.argmax(model(X_test), dim=1)
+
+    y_true = y_test.cpu().numpy()
+    y_pred = predictions.cpu().numpy()
+
+    accuracy = accuracy_score(y_true, y_pred)
+    macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    report = classification_report(
         y_true,
         y_pred,
-        labels=np.arange(len(label_encoder.classes_)),
-        target_names=label_encoder.classes_,
-        zero_division=0
+        labels=np.arange(len(classes)),
+        target_names=classes,
+        zero_division=0,
     )
-)
 
-ConfusionMatrixDisplay.from_predictions(
-    y_true,
-    y_pred,
-    labels=np.arange(len(label_encoder.classes_)),
-    display_labels=label_encoder.classes_,
-    xticks_rotation=45,
-    cmap="Blues"
-)
+    print(f"\nTest Accuracy: {accuracy:.2%}")
+    print(f"Test Macro-F1: {macro_f1:.2%}")
+    print("\nClassification Report:")
+    print(report)
 
-plt.title("CNN Emotion Recognition - Confusion Matrix")
-plt.tight_layout()
-plt.savefig("data/processed/cnn_confusion_matrix.png")
-plt.show()
+    # ------------------------------------------------------------- outputs
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    MODEL_DIR.mkdir(exist_ok=True)
+
+    (RESULTS_DIR / "cnn_classification_report.txt").write_text(report)
+    (RESULTS_DIR / "cnn_metrics.json").write_text(json.dumps({
+        "model": "CNN on 13x200 MFCC matrices",
+        "test_actors": sorted(int(a) for a in set(groups[test_idx])),
+        "test_samples": int(len(y_true)),
+        "epochs_trained": len(history["train_loss"]),
+        "accuracy": round(float(accuracy), 4),
+        "macro_f1": round(float(macro_f1), 4),
+    }, indent=2))
+
+    ConfusionMatrixDisplay.from_predictions(
+        y_true,
+        y_pred,
+        labels=np.arange(len(classes)),
+        display_labels=classes,
+        xticks_rotation=45,
+        cmap="Blues",
+    )
+    plt.title("CNN Emotion Recognition - Confusion Matrix")
+    plt.tight_layout()
+    plt.savefig(RESULTS_DIR / "cnn_confusion_matrix.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(history["train_loss"], label="train")
+    plt.plot(history["val_loss"], label="validation")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("CNN Training Curve")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(RESULTS_DIR / "cnn_training_curve.png", dpi=200)
+    plt.close()
+
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "emotion_classes": classes,
+            "mean": mean.tolist(),
+            "std": std.tolist(),
+            "n_mfcc": N_MFCC,
+            "max_len": MAX_LEN,
+        },
+        MODEL_DIR / "emotion_cnn.pth",
+    )
+
+    print("Saved model to:", MODEL_DIR / "emotion_cnn.pth")
+    print("Saved results to:", RESULTS_DIR)
 
 
-from pathlib import Path
-
-# Model üçün qovluq yarat
-MODEL_DIR = Path("models")
-MODEL_DIR.mkdir(exist_ok=True)
-
-# Öyrədilmiş modeli və emosiya adlarını saxla
-torch.save(
-    {
-        "model_state_dict": model.state_dict(),
-        "emotion_classes": label_encoder.classes_.tolist(),
-    },
-    MODEL_DIR / "emotion_cnn.pth"
-)
-
-print("Model saved to models/emotion_cnn.pth")
+if __name__ == "__main__":
+    main()

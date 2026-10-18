@@ -1,128 +1,87 @@
+"""Train and evaluate the SVM baseline (actor-independent split)."""
 
+import json
 from pathlib import Path
 
 import joblib
 import matplotlib.pyplot as plt
 import pandas as pd
-
 from sklearn.metrics import (
+    ConfusionMatrixDisplay,
     accuracy_score,
     classification_report,
     confusion_matrix,
-    ConfusionMatrixDisplay,
+    f1_score,
 )
-from sklearn.model_selection import GroupShuffleSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
+from utils import SEED, actor_split, set_seed
 
-# 1. Fayl yolları
 DATA_PATH = Path("data/processed/features.csv")
 MODEL_PATH = Path("models/emotion_model.pkl")
+RESULTS_DIR = Path("results")
 
 
 def main():
-    # 2. Xüsusiyyətləri oxu
-    df = pd.read_csv(DATA_PATH)
+    set_seed(SEED)
 
-    # 3. Xüsusiyyətləri (X), etiketləri (y) və aktyor qruplarını ayır
+    df = pd.read_csv(DATA_PATH)
     X = df.drop(columns=["emotion", "actor_id"])
     y = df["emotion"]
-    groups = df["actor_id"]
+    groups = df["actor_id"].to_numpy()
 
-    # 4. Dataset-i aktyorlara görə train və test hissələrinə böl
-    splitter = GroupShuffleSplit(
-        n_splits=1,
-        test_size=0.2,
-        random_state=42,
-    )
+    # Actor-independent split: the same test actors are used by the CNN script
+    train_idx, test_idx = actor_split(groups)
 
-    train_idx, test_idx = next(
-        splitter.split(X, y, groups=groups)
-    )
+    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
-    X_train = X.iloc[train_idx]
-    X_test = X.iloc[test_idx]
-    y_train = y.iloc[train_idx]
-    y_test = y.iloc[test_idx]
+    print("Training samples:", len(X_train), "| Testing samples:", len(X_test))
+    print("Training actors:", sorted(int(a) for a in set(groups[train_idx])))
+    print("Testing actors: ", sorted(int(a) for a in set(groups[test_idx])))
 
-    train_actors = set(groups.iloc[train_idx])
-    test_actors = set(groups.iloc[test_idx])
-
-    print("Training samples:", len(X_train))
-    print("Testing samples:", len(X_test))
-    print("Training actors:", sorted(train_actors))
-    print("Testing actors:", sorted(test_actors))
-
-    # 5. Eyni aktyorun hər iki dəstə düşmədiyini yoxla
-    assert train_actors.isdisjoint(test_actors), (
-        "Error: An actor appears in both training and testing sets."
-    )
-
-    # 6. SVM modelini yarat
     model = make_pipeline(
         StandardScaler(),
-        SVC(
-            kernel="rbf",
-            C=10,
-            gamma="scale",
-        ),
+        SVC(kernel="rbf", C=10, gamma="scale"),
     )
-
-    # 7. Modeli öyrət
     model.fit(X_train, y_train)
-
-    # 8. Test dəsti üçün proqnoz ver
     y_pred = model.predict(X_test)
 
-    # 9. Nəticələri qiymətləndir
     accuracy = accuracy_score(y_test, y_pred)
+    macro_f1 = f1_score(y_test, y_pred, average="macro", zero_division=0)
+    report = classification_report(y_test, y_pred, zero_division=0)
 
     print(f"\nAccuracy: {accuracy:.2%}")
+    print(f"Macro-F1: {macro_f1:.2%}")
     print("\nClassification Report:")
-    print(
-        classification_report(
-            y_test,
-            y_pred,
-            zero_division=0,
-        )
-    )
+    print(report)
 
-    # 10. Confusion matrix yarat və göstər
-    cm = confusion_matrix(
-        y_test,
-        y_pred,
-        labels=model.classes_,
-    )
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    disp = ConfusionMatrixDisplay(
-        confusion_matrix=cm,
-        display_labels=model.classes_,
-    )
+    (RESULTS_DIR / "svm_classification_report.txt").write_text(report)
+    (RESULTS_DIR / "svm_metrics.json").write_text(json.dumps({
+        "model": "SVM (RBF, C=10) on MFCC mean/std",
+        "test_actors": sorted(int(a) for a in set(groups[test_idx])),
+        "test_samples": int(len(y_test)),
+        "accuracy": round(float(accuracy), 4),
+        "macro_f1": round(float(macro_f1), 4),
+    }, indent=2))
 
+    cm = confusion_matrix(y_test, y_pred, labels=model.classes_)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=model.classes_)
     disp.plot(xticks_rotation=45)
     plt.title("SVM Emotion Recognition - Confusion Matrix")
     plt.tight_layout()
-
-    # Qrafiki fayl kimi saxla
-    results_path = Path("results")
-    results_path.mkdir(parents=True, exist_ok=True)
-
-    plt.savefig(
-        results_path / "svm_confusion_matrix.png",
-        dpi=300,
-        bbox_inches="tight",
-    )
-    plt.show()
+    plt.savefig(RESULTS_DIR / "svm_confusion_matrix.png", dpi=300, bbox_inches="tight")
     plt.close()
 
-    # 11. Öyrədilmiş modeli saxla
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, MODEL_PATH)
 
-    print("\nModel saved to:", MODEL_PATH)
-    print("Confusion matrix saved to:", results_path / "svm_confusion_matrix.png")
+    print("Saved model to:", MODEL_PATH)
+    print("Saved results to:", RESULTS_DIR)
 
 
 if __name__ == "__main__":
