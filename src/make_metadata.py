@@ -1,9 +1,10 @@
+
 from pathlib import Path
 import pandas as pd
 
 DATA_DIR = Path("data")
 
-EMOTIONS = {
+emotion_map = {
     "01": "neutral",
     "02": "calm",
     "03": "happy",
@@ -14,21 +15,30 @@ EMOTIONS = {
     "08": "surprised",
 }
 
+audio_files = sorted(DATA_DIR.rglob("*.wav"))
 rows = []
-for path in sorted(DATA_DIR.glob("Actor_*/*.wav")):
-    parts = path.stem.split("-")  # ['03','01','05','01','02','01','12']
+
+for file in audio_files:
+    parts = file.stem.split("-")
+
     rows.append({
-        "path": path.as_posix(),
-        "emotion": EMOTIONS[parts[2]],
-        "intensity": "normal" if parts[3] == "01" else "strong",
-        "actor": int(parts[6]),
+        "file_path": str(file),
+        "actor_id": int(parts[6]),
+        "emotion_code": parts[2],
+        "emotion": emotion_map[parts[2]],
     })
 
 df = pd.DataFrame(rows)
-df.to_csv("metadata.csv", index=False)
 
-print("Cədvəlin ölçüsü:", df.shape)
+output_dir = Path("data/processed")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+output_file = output_dir / "metadata.csv"
+df.to_csv(output_file, index=False)
+
+print("Total audio files:", len(df))
+print("\nEmotion distribution:")
+print(df["emotion"].value_counts().sort_index())
+print("\nSaved metadata to:", output_file)
+print("\nPreview:")
 print(df.head())
-print("\nHər emosiyada nümunə sayı:")
-print(df["emotion"].value_counts())
-print("\nAktyor sayı:", df["actor"].nunique())
