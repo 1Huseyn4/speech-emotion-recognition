@@ -1,0 +1,14 @@
+{
+  "model": "CNN on 13x200 MFCC matrices",
+  "test_actors": [
+    1,
+    9,
+    12,
+    17,
+    19
+  ],
+  "test_samples": 300,
+  "epochs_trained": 42,
+  "accuracy": 0.45,
+  "macro_f1": 0.4528
+}

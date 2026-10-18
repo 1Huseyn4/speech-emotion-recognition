@@ -1,0 +1,13 @@
+{
+  "model": "SVM (RBF, C=10) on MFCC mean/std",
+  "test_actors": [
+    1,
+    9,
+    12,
+    17,
+    19
+  ],
+  "test_samples": 300,
+  "accuracy": 0.3667,
+  "macro_f1": 0.3492
+}

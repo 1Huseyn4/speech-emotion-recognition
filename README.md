@@ -89,14 +89,16 @@ Training scripts write confusion matrices, classification reports and `*_metrics
 
 ## Results
 
-Test set: held-out actors, speaker-independent. Chance level for 8 classes is 12.5%.
+Test set: 300 recordings from held-out actors (1, 9, 12, 17, 19). The evaluation is speaker-independent. Chance-level accuracy for 8 classes is 12.5%.
 
 | Model | Accuracy | Macro-F1 |
 | ----- | -------- | -------- |
-| SVM (MFCC mean/std) | XX.XX% | XX.XX% |
-| CNN (MFCC matrix)   | XX.XX% | XX.XX% |
+| SVM (MFCC mean/std) | 36.67% | 34.92% |
+| CNN (MFCC matrix) | 45.00% | 45.28% |
 
-Detailed outputs are in `results/`:
+The CNN outperformed the SVM on this test split. Results may vary with different actor splits and training settings.
+
+Detailed outputs are available in `results/`:
 
 - `svm_confusion_matrix.png`, `svm_classification_report.txt`, `svm_metrics.json`
 - `cnn_confusion_matrix.png`, `cnn_classification_report.txt`, `cnn_metrics.json`, `cnn_training_curve.png`
